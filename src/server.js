@@ -1309,33 +1309,89 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
   }
 });
 
-// --- DataX A2A push webhook ---
+// --- DataX A2A push webhook (per-account routing) ---
 // Receives A2A StreamResponse or legacy DataX webhook payloads and delivers
-// them to the agent's Telegram chat directly via the Bot API. Bypasses the
-// OpenClaw gateway entirely so deal-event notifications still work when the
-// Control UI is flaky. Secured by a bearer token: DataX sends
-//   Authorization: Bearer $DATAX_WEBHOOK_SECRET
-// and we reject anything that doesn't match.
+// them to the correct Telegram bot account based on the URL path parameter.
 //
-// Required env vars:
-//   DATAX_WEBHOOK_SECRET    — matches `webhookSecret` set on DataX via PATCH /api/agents/me.
-//   DATAX_TELEGRAM_CHAT_ID  — numeric Telegram chat id to post to (e.g. 474205181).
+// URL:  POST /hooks/datax          — uses the "default" account
+//       POST /hooks/datax/:account — uses the named account (e.g. "agent2")
 //
-// Optional env var:
-//   DATAX_TELEGRAM_BOT_TOKEN — explicit bot token. If unset, we read botToken
-//                              from the OpenClaw config on the mounted volume.
-function readTelegramBotToken() {
-  const fromEnv = process.env.DATAX_TELEGRAM_BOT_TOKEN?.trim();
-  if (fromEnv) return fromEnv;
+// The :account parameter must match a key under
+// channels.telegram.accounts.<account>.botToken in openclaw.json.
+// This lets a single OpenClaw deployment serve multiple DataX agents, each
+// with its own Telegram bot, without any code changes per agent.
+//
+// Required env var:
+//   DATAX_WEBHOOK_SECRET — shared bearer token; all accounts use the same secret.
+//
+// Per-account env vars (optional — falls back to openclaw.json):
+//   DATAX_TELEGRAM_CHAT_ID__<account>  e.g. DATAX_TELEGRAM_CHAT_ID__agent2
+//   DATAX_TELEGRAM_BOT_TOKEN__<account> e.g. DATAX_TELEGRAM_BOT_TOKEN__agent2
+//
+// Global fallback env vars (used when per-account vars are absent):
+//   DATAX_TELEGRAM_CHAT_ID
+//   DATAX_TELEGRAM_BOT_TOKEN
+
+/**
+ * Read bot token for the given account name.
+ *
+ * Priority:
+ *   1. DATAX_TELEGRAM_BOT_TOKEN__<account> env var
+ *   2. DATAX_TELEGRAM_BOT_TOKEN env var (global fallback)
+ *   3. openclaw.json channels.telegram.accounts.<account>.botToken
+ *   4. openclaw.json channels.telegram.botToken (legacy single-account config)
+ */
+function readTelegramBotToken(accountName = "default") {
+  // 1. Per-account env var
+  const perAccountKey = `DATAX_TELEGRAM_BOT_TOKEN__${accountName}`;
+  const fromEnvAccount = process.env[perAccountKey]?.trim();
+  if (fromEnvAccount) return fromEnvAccount;
+
+  // 2. Global fallback env var
+  const fromEnvGlobal = process.env.DATAX_TELEGRAM_BOT_TOKEN?.trim();
+  if (fromEnvGlobal) return fromEnvGlobal;
+
+  // 3. openclaw.json accounts map
   try {
     const cfgPath = configPath();
     if (!fs.existsSync(cfgPath)) return null;
     const raw = fs.readFileSync(cfgPath, "utf8");
     const cfg = JSON.parse(raw);
-    const token = cfg?.channels?.telegram?.botToken?.trim();
-    return token || null;
+    const accountToken = cfg?.channels?.telegram?.accounts?.[accountName]?.botToken?.trim();
+    if (accountToken) return accountToken;
+    // 4. Legacy flat botToken field
+    const legacyToken = cfg?.channels?.telegram?.botToken?.trim();
+    return legacyToken || null;
   } catch (err) {
-    console.error("[hooks/datax] failed to read openclaw config:", err);
+    console.error("[hooks/datax] failed to read openclaw config for account", accountName, err);
+    return null;
+  }
+}
+
+/**
+ * Read chat id for the given account name.
+ *
+ * Priority:
+ *   1. DATAX_TELEGRAM_CHAT_ID__<account> env var
+ *   2. DATAX_TELEGRAM_CHAT_ID env var (global fallback)
+ *   3. openclaw.json channels.telegram.accounts.<account>.dmChatId (if present)
+ */
+function readTelegramChatId(accountName = "default") {
+  const perAccountKey = `DATAX_TELEGRAM_CHAT_ID__${accountName}`;
+  const fromEnvAccount = process.env[perAccountKey]?.trim();
+  if (fromEnvAccount) return fromEnvAccount;
+
+  const fromEnvGlobal = process.env.DATAX_TELEGRAM_CHAT_ID?.trim();
+  if (fromEnvGlobal) return fromEnvGlobal;
+
+  try {
+    const cfgPath = configPath();
+    if (!fs.existsSync(cfgPath)) return null;
+    const raw = fs.readFileSync(cfgPath, "utf8");
+    const cfg = JSON.parse(raw);
+    const chatId = cfg?.channels?.telegram?.accounts?.[accountName]?.dmChatId;
+    return chatId ? String(chatId).trim() : null;
+  } catch {
     return null;
   }
 }
@@ -1423,7 +1479,7 @@ function formatDataxPayload(body) {
   return `<b>DataX event</b>\n<pre>${escapeHtmlForTelegram(dump)}</pre>`;
 }
 
-app.post("/hooks/datax", async (req, res) => {
+async function handleDataxHook(req, res, accountName) {
   const expected = process.env.DATAX_WEBHOOK_SECRET?.trim();
   if (!expected) {
     console.error("[hooks/datax] DATAX_WEBHOOK_SECRET not set");
@@ -1435,17 +1491,17 @@ app.post("/hooks/datax", async (req, res) => {
     return res.status(401).json({ ok: false, error: "Invalid bearer token" });
   }
 
-  const chatId = process.env.DATAX_TELEGRAM_CHAT_ID?.trim();
-  const botToken = readTelegramBotToken();
+  const chatId = readTelegramChatId(accountName);
+  const botToken = readTelegramBotToken(accountName);
   if (!chatId || !botToken) {
     console.error(
-      "[hooks/datax] telegram not configured",
+      `[hooks/datax] telegram not configured for account=${accountName}`,
       "chatId?", Boolean(chatId),
       "botToken?", Boolean(botToken),
     );
     return res.status(503).json({
       ok: false,
-      error: "Telegram not configured on this OpenClaw deployment",
+      error: `Telegram not configured for account "${accountName}". Set DATAX_TELEGRAM_CHAT_ID__${accountName} and DATAX_TELEGRAM_BOT_TOKEN__${accountName}, or ensure openclaw.json has channels.telegram.accounts.${accountName}.botToken.`,
     });
   }
 
@@ -1463,17 +1519,31 @@ app.post("/hooks/datax", async (req, res) => {
     });
     const tgBody = await tgRes.json().catch(() => ({}));
     if (!tgRes.ok || tgBody.ok === false) {
-      console.error("[hooks/datax] telegram sendMessage failed", tgRes.status, tgBody);
+      console.error(`[hooks/datax] telegram sendMessage failed account=${accountName}`, tgRes.status, tgBody);
       return res
         .status(502)
         .json({ ok: false, error: "Telegram API error", telegram: tgBody });
     }
-    console.log(`[hooks/datax] forwarded to chat=${chatId}`);
-    return res.status(200).json({ ok: true });
+    console.log(`[hooks/datax] forwarded account=${accountName} chat=${chatId}`);
+    return res.status(200).json({ ok: true, account: accountName });
   } catch (err) {
-    console.error("[hooks/datax] error:", err);
+    console.error(`[hooks/datax] error account=${accountName}`, err);
     return res.status(500).json({ ok: false, error: String(err) });
   }
+}
+
+// /hooks/datax/<account> — per-account routing (buyer → /hooks/datax/default, seller → /hooks/datax/agent2)
+app.post("/hooks/datax/:account", async (req, res) => {
+  const account = req.params.account?.trim();
+  if (!account || !/^[a-zA-Z0-9_-]{1,64}$/.test(account)) {
+    return res.status(400).json({ ok: false, error: "Invalid account name in URL" });
+  }
+  return handleDataxHook(req, res, account);
+});
+
+// /hooks/datax — backward-compatible: uses "default" account
+app.post("/hooks/datax", async (req, res) => {
+  return handleDataxHook(req, res, "default");
 });
 
 // Proxy everything else to the gateway.
