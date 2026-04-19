@@ -1309,6 +1309,173 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
   }
 });
 
+// --- DataX A2A push webhook ---
+// Receives A2A StreamResponse or legacy DataX webhook payloads and delivers
+// them to the agent's Telegram chat directly via the Bot API. Bypasses the
+// OpenClaw gateway entirely so deal-event notifications still work when the
+// Control UI is flaky. Secured by a bearer token: DataX sends
+//   Authorization: Bearer $DATAX_WEBHOOK_SECRET
+// and we reject anything that doesn't match.
+//
+// Required env vars:
+//   DATAX_WEBHOOK_SECRET    — matches `webhookSecret` set on DataX via PATCH /api/agents/me.
+//   DATAX_TELEGRAM_CHAT_ID  — numeric Telegram chat id to post to (e.g. 474205181).
+//
+// Optional env var:
+//   DATAX_TELEGRAM_BOT_TOKEN — explicit bot token. If unset, we read botToken
+//                              from the OpenClaw config on the mounted volume.
+function readTelegramBotToken() {
+  const fromEnv = process.env.DATAX_TELEGRAM_BOT_TOKEN?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const cfgPath = configPath();
+    if (!fs.existsSync(cfgPath)) return null;
+    const raw = fs.readFileSync(cfgPath, "utf8");
+    const cfg = JSON.parse(raw);
+    const token = cfg?.channels?.telegram?.botToken?.trim();
+    return token || null;
+  } catch (err) {
+    console.error("[hooks/datax] failed to read openclaw config:", err);
+    return null;
+  }
+}
+
+function escapeHtmlForTelegram(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function formatDataxPayload(body) {
+  if (!body || typeof body !== "object") {
+    return "<b>DataX event</b>\n(empty payload)";
+  }
+  // A2A StreamResponse shapes (spec Section 3.2.3)
+  if (body.statusUpdate) {
+    const u = body.statusUpdate;
+    const state = u.status?.state || "unknown";
+    const note = u.status?.message?.parts?.find((p) => typeof p?.text === "string")?.text;
+    const lines = [
+      "<b>DataX task update</b>",
+      `Task: <code>${escapeHtmlForTelegram(u.taskId || "?")}</code>`,
+      `State: <b>${escapeHtmlForTelegram(state)}</b>`,
+    ];
+    if (u.contextId) lines.push(`Listing: <code>${escapeHtmlForTelegram(u.contextId)}</code>`);
+    if (note) lines.push(escapeHtmlForTelegram(note));
+    return lines.join("\n");
+  }
+  if (body.artifactUpdate) {
+    const a = body.artifactUpdate.artifact || {};
+    return [
+      "<b>DataX artifact released</b>",
+      `Task: <code>${escapeHtmlForTelegram(body.artifactUpdate.taskId || "?")}</code>`,
+      `Artifact: ${escapeHtmlForTelegram(a.name || a.artifactId || "?")}`,
+      a.description ? escapeHtmlForTelegram(a.description) : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (body.task) {
+    const t = body.task;
+    return [
+      "<b>DataX task</b>",
+      `Task: <code>${escapeHtmlForTelegram(t.id || "?")}</code>`,
+      `State: <b>${escapeHtmlForTelegram(t.status?.state || "unknown")}</b>`,
+    ].join("\n");
+  }
+  if (body.message) {
+    const m = body.message;
+    const text = m.parts?.find((p) => typeof p?.text === "string")?.text || "(no text)";
+    return [`<b>DataX message</b>`, escapeHtmlForTelegram(text)].join("\n");
+  }
+
+  // Legacy DataX webhook shape (pre-A2A): { event, dealId, status, yourRole, ... }
+  if (body.event === "deal_updated") {
+    const role = body.yourRole || "?";
+    const status = body.status || "?";
+    const lines = [
+      `<b>DataX deal (${escapeHtmlForTelegram(role)})</b>`,
+      `Deal: <code>${escapeHtmlForTelegram(body.dealId || "?")}</code>`,
+      `Status: <b>${escapeHtmlForTelegram(status)}</b>`,
+    ];
+    if (body.counterAmount && body.counterCurrency) {
+      lines.push(`Counter: ${escapeHtmlForTelegram(body.counterAmount)} ${escapeHtmlForTelegram(body.counterCurrency)}`);
+    }
+    if (body.agreedAmount && body.agreedCurrency) {
+      lines.push(`Agreed: ${escapeHtmlForTelegram(body.agreedAmount)} ${escapeHtmlForTelegram(body.agreedCurrency)}`);
+    }
+    if (body.sellerCryptoWallet) {
+      lines.push(`Seller wallet: <code>${escapeHtmlForTelegram(body.sellerCryptoWallet)}</code>`);
+    }
+    if (Array.isArray(body.nextHttp) && body.nextHttp.length > 0) {
+      lines.push("Next actions:");
+      for (const h of body.nextHttp) {
+        const note = h.note ? ` — ${h.note}` : "";
+        lines.push(`• ${h.method} ${h.path}${note}`.replace(/</g, "&lt;"));
+      }
+    }
+    return lines.join("\n");
+  }
+
+  // Unknown shape — dump (truncated) for debugging.
+  const dump = JSON.stringify(body, null, 2).slice(0, 3500);
+  return `<b>DataX event</b>\n<pre>${escapeHtmlForTelegram(dump)}</pre>`;
+}
+
+app.post("/hooks/datax", async (req, res) => {
+  const expected = process.env.DATAX_WEBHOOK_SECRET?.trim();
+  if (!expected) {
+    console.error("[hooks/datax] DATAX_WEBHOOK_SECRET not set");
+    return res.status(503).json({ ok: false, error: "Webhook not configured" });
+  }
+  const auth = (req.headers.authorization || "").trim();
+  const received = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  if (!received || received !== expected) {
+    return res.status(401).json({ ok: false, error: "Invalid bearer token" });
+  }
+
+  const chatId = process.env.DATAX_TELEGRAM_CHAT_ID?.trim();
+  const botToken = readTelegramBotToken();
+  if (!chatId || !botToken) {
+    console.error(
+      "[hooks/datax] telegram not configured",
+      "chatId?", Boolean(chatId),
+      "botToken?", Boolean(botToken),
+    );
+    return res.status(503).json({
+      ok: false,
+      error: "Telegram not configured on this OpenClaw deployment",
+    });
+  }
+
+  const text = formatDataxPayload(req.body);
+  try {
+    const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+    const tgBody = await tgRes.json().catch(() => ({}));
+    if (!tgRes.ok || tgBody.ok === false) {
+      console.error("[hooks/datax] telegram sendMessage failed", tgRes.status, tgBody);
+      return res
+        .status(502)
+        .json({ ok: false, error: "Telegram API error", telegram: tgBody });
+    }
+    console.log(`[hooks/datax] forwarded to chat=${chatId}`);
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error("[hooks/datax] error:", err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 // Proxy everything else to the gateway.
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
